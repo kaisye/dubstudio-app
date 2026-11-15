@@ -1,0 +1,166 @@
+name: Build desktop apps
+
+# Builds the DubStudio installers (macOS Apple Silicon .dmg, Windows .exe) from the private source repo
+# and publishes them as a release of this public repo.
+# Run: Actions → "Build desktop apps" → Run workflow → enter the source tag (e.g. v0.1.2).
+# CLI:  gh workflow run desktop.yml -R kaisye/dubstudio-app -f ref=v0.1.2
+# The source is read with a read-only deploy key (secret SOURCE_DEPLOY_KEY); nothing from it is published
+# except the installers.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag (hoặc nhánh) của mã nguồn cần build, ví dụ v0.1.2"
+        required: true
+      publish:
+        description: "Đăng bản cài lên Releases (bỏ chọn để chỉ build thử)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: kaisye/DubStudio
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Backend tests
+        working-directory: backend
+        run: |
+          uv sync --frozen
+          uv run --frozen ruff check dubstudio tests
+          uv run --frozen pytest -q -p no:warnings
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Frontend typecheck + build
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15 # Apple Silicon runner
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+            artifact: DubStudio-macOS-arm64
+            files: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            artifact: DubStudio-Windows-x64
+            files: desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: kaisye/DubStudio
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Build the UI
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Install desktop tooling
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+
+      - name: Freeze the backend sidecar
+        working-directory: desktop
+        run: npm run build:backend -- --target ${{ matrix.target }}
+
+      - name: Bundle ffmpeg / ffprobe
+        working-directory: desktop
+        run: npm run prepare:media
+
+      - name: Smoke-test the frozen backend
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          bin="desktop/src-tauri/binaries/dubstudio-api-${{ matrix.target }}$ext"
+          DUBSTUDIO_PORT=18799 DUBSTUDIO_DATA_DIR="$RUNNER_TEMP/dubstudio-smoke" DUBSTUDIO_NO_ENV_FILE=1 \
+            DUBSTUDIO_NO_AUTO_REMEASURE=1 "$bin" > "$RUNNER_TEMP/backend.log" 2>&1 &
+          pid=$!
+          for i in $(seq 1 150); do
+            if curl -sf http://127.0.0.1:18799/api/health > /dev/null && curl -sf http://127.0.0.1:18799/ | grep -q DubStudio; then
+              echo "Backend and UI answered after ${i}s"; kill $pid || true; exit 0
+            fi
+            if ! kill -0 $pid 2>/dev/null; then echo "::error::Backend exited early"; cat "$RUNNER_TEMP/backend.log"; exit 1; fi
+            sleep 1
+          done
+          echo "::error::Backend did not start within 150s"; cat "$RUNNER_TEMP/backend.log"; kill $pid || true; exit 1
+
+      - name: Build the installer
+        working-directory: desktop
+        run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+
+  release:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$TAG" dist/* --repo "${{ github.repository }}" \
+              --title "DubStudio $TAG" --notes "Bản cài macOS (Apple Silicon) và Windows."
+          fi

@@ -223,6 +223,10 @@ jobs:
                "darwin-aarch64": {signature: $macsig, url: $macurl},
                "windows-x86_64": {signature: $winsig, url: $winurl}}}' > latest.json
           cat latest.json
+          # Same installers under fixed names: releases/latest/download/<name> always gets the newest one
+          # (used by the download page).
+          cp "DubStudio_${version}_aarch64.dmg" DubStudio_macOS.dmg
+          cp "$win" DubStudio_Windows-setup.exe
           ls -la
 
       - name: Publish release

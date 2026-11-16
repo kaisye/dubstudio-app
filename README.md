@@ -6,8 +6,8 @@ Công cụ hỗ trợ lồng tiếng Anh → Việt: chép lời, dịch vừa k
 
 Bản mới nhất ở trang [Releases](https://github.com/kaisye/dubstudio-app/releases/latest):
 
-- **macOS** (Apple Silicon, macOS 12+): file `.dmg`
-- **Windows** (10/11, 64-bit): file `-setup.exe`
+- **macOS** (Apple Silicon, macOS 12+): [DubStudio_macOS.dmg](https://github.com/kaisye/dubstudio-app/releases/latest/download/DubStudio_macOS.dmg)
+- **Windows** (10/11, 64-bit): [DubStudio_Windows-setup.exe](https://github.com/kaisye/dubstudio-app/releases/latest/download/DubStudio_Windows-setup.exe)
 
 ### Lần đầu mở app
 

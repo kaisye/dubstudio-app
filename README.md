@@ -15,3 +15,7 @@ Bản mới nhất ở trang [Releases](https://github.com/kaisye/dubstudio-app/
 - Windows: nếu thấy màn hình bảo vệ, chọn *Thông tin thêm* → *Vẫn chạy*.
 
 Repo này chỉ chứa bản cài; mã nguồn không công khai.
+
+## Trang giới thiệu
+
+`site/index.html` là trang giới thiệu (một file HTML tĩnh), được Cloudflare Pages deploy từ thư mục `site/`.

@@ -6,6 +6,12 @@ name: Build desktop apps
 # CLI:  gh workflow run desktop.yml -R kaisye/dubstudio-app -f ref=v0.1.2
 # The source is read with a read-only deploy key (secret SOURCE_DEPLOY_KEY); nothing from it is published
 # except the installers.
+#
+# Auto-update: every release also carries signed update packages and latest.json, which installed apps
+# read from releases/latest. Signing key: secrets TAURI_SIGNING_PRIVATE_KEY (+ _PASSWORD).
+# Apple signing + notarization (optional, used when APPLE_CERTIFICATE is set): APPLE_CERTIFICATE
+# (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD
+# (app-specific password), APPLE_TEAM_ID. Without them the Mac build is ad-hoc signed as before.
 on:
   workflow_dispatch:
     inputs:
@@ -64,13 +70,20 @@ jobs:
             target: aarch64-apple-darwin
             bundles: app,dmg
             artifact: DubStudio-macOS-arm64
-            files: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            files: |
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
             artifact: DubStudio-Windows-x64
-            files: desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            files: |
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
     runs-on: ${{ matrix.os }}
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -134,8 +147,42 @@ jobs:
           done
           echo "::error::Backend did not start within 150s"; cat "$RUNNER_TEMP/backend.log"; kill $pid || true; exit 1
 
+      - name: Import the Apple signing certificate
+        if: runner.os == 'macOS' && env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(openssl rand -hex 16)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          # Bundled media tools are resources, which the bundler does not sign; notarization needs them signed.
+          for f in desktop/src-tauri/resources/bin/ffmpeg desktop/src-tauri/resources/bin/ffprobe; do
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$f"
+          done
+          {
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            echo "APPLE_ID=$APPLE_ID"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+          } >> "$GITHUB_ENV"
+
       - name: Build the installer
         working-directory: desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - uses: actions/upload-artifact@v7
@@ -153,6 +200,31 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Write latest.json (read by installed apps to update themselves)
+        env:
+          TAG: ${{ inputs.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          # Several upload paths keep their folders (dmg/, macos/): flatten.
+          find . -mindepth 2 -type f -exec mv {} . \;
+          find . -mindepth 1 -type d -empty -delete
+          version="${TAG#v}"
+          # Give the Mac update package a versioned name; its signature covers the content, not the name.
+          mv DubStudio.app.tar.gz "DubStudio_${version}_aarch64.app.tar.gz"
+          mv DubStudio.app.tar.gz.sig "DubStudio_${version}_aarch64.app.tar.gz.sig"
+          mac="DubStudio_${version}_aarch64.app.tar.gz"
+          win="$(ls *_x64-setup.exe | head -n1)"
+          base="https://github.com/$REPO/releases/download/$TAG"
+          jq -n --arg v "$version" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg macsig "$(cat "$mac.sig")" --arg macurl "$base/$mac" \
+            --arg winsig "$(cat "$win.sig")" --arg winurl "$base/$win" \
+            '{version: $v, notes: "DubStudio \($v)", pub_date: $date, platforms: {
+               "darwin-aarch64": {signature: $macsig, url: $macurl},
+               "windows-x86_64": {signature: $winsig, url: $winurl}}}' > latest.json
+          cat latest.json
+          ls -la
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
